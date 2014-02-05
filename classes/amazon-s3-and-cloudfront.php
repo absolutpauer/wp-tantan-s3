@@ -19,7 +19,7 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
 		add_action( 'wp_ajax_as3cf-create-bucket', array( $this, 'ajax_create_bucket' ) );
 
 		add_filter( 'wp_get_attachment_url', array( $this, 'wp_get_attachment_url' ), 9, 2 );
-		add_filter( 'wp_generate_attachment_metadata', array( $this, 'wp_generate_attachment_metadata' ), 20, 2 );
+		add_action( 'transition_post_status', array( $this, 'transition_post_status' ), 20, 3 );
 		add_filter( 'delete_attachment', array( $this, 'delete_attachment' ), 20 );
 	}
 
@@ -112,11 +112,25 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
         delete_post_meta( $post_id, 'amazonS3_info' );
     }
 
-    function wp_generate_attachment_metadata( $data, $post_id ) {
-        if ( !$this->get_setting( 'copy-to-s3' ) || !$this->is_plugin_setup() ) {
-            return $data;
-        }
+    function transition_post_status( $new_status, $old_status, $post ) {
+    	if ( $this->get_setting( 'copy-to-s3' ) && $this->is_plugin_setup() && $new_status == 'publish' ) {
+    		$attachments = get_posts( array( 
+				'post_type' => 'attachment',
+				'numberposts' => -1,
+				'post_status' => 'any',
+				'post_parent' => $post->ID
+			) );
 
+    		foreach ( $attachments as $attachment ) {
+    			$post_id = $attachment->ID;
+    			$data = wp_get_attachment_metadata( $post_id );
+
+    			$this->upload_attachment( $data, $post_id );
+    		}
+    	}
+    }
+
+    function upload_attachment( $data, $post_id ) {
         $time = $this->get_attachment_folder_time( $post_id );
         $time = date( 'Y/m', $time );
 
@@ -135,7 +149,7 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
         $acl = apply_filters( 'as3cf_upload_acl', $acl, $data, $post_id );
 
         if ( !file_exists( $file_path ) ) {
-        	return $data;
+        	return;
         }
 
         $file_name = basename( $file_path );
@@ -162,7 +176,7 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
 		}
 		catch ( Exception $e ) {
 			error_log( 'Error uploading ' . $file_path . ' to S3: ' . $e->getMessage() );
-			return $data;
+			return;
 		}
 
         delete_post_meta( $post_id, 'amazonS3_info' );
@@ -225,8 +239,6 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
         if ( $this->get_setting( 'remove-local-file' ) ) {
         	$this->remove_local_files( $files_to_remove );
         }
-
-        return $data;
     }
 
     function remove_local_files( $file_paths ) {
