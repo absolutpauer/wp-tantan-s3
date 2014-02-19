@@ -19,7 +19,7 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
 		add_action( 'wp_ajax_as3cf-create-bucket', array( $this, 'ajax_create_bucket' ) );
 
 		add_filter( 'wp_get_attachment_url', array( $this, 'wp_get_attachment_url' ), 9, 2 );
-		add_action( 'transition_post_status', array( $this, 'transition_post_status' ), 20, 3 );
+		add_filter( 'wp_insert_post_data', array( $this, 'wp_insert_post_data' ), 20, 2 );
 		add_filter( 'delete_attachment', array( $this, 'delete_attachment' ), 20 );
 	}
 
@@ -112,25 +112,48 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
         delete_post_meta( $post_id, 'amazonS3_info' );
     }
 
-    function transition_post_status( $new_status, $old_status, $post ) {
-    	if ( $this->get_setting( 'copy-to-s3' ) && $this->is_plugin_setup() && $new_status == 'publish' ) {
-    		$attachments = get_posts( array( 
+    function get_base_url( $url ) {
+    	return substr( $url, 0, strrpos( $url, '/' ) + 1 );
+    }
+
+    function wp_insert_post_data( $postdata , $postarr ) {
+    	if ( !$this->get_setting( 'copy-to-s3' ) || !$this->is_plugin_setup() ) {
+    		return $postdata;
+    	}
+
+        if ( $postdata['post_status'] == 'publish' ) {
+        	$attachments = get_posts( array( 
 				'post_type' => 'attachment',
 				'numberposts' => -1,
 				'post_status' => 'any',
-				'post_parent' => $post->ID
+				'post_parent' => $postarr['ID']
 			) );
 
     		foreach ( $attachments as $attachment ) {
-    			$post_id = $attachment->ID;
-    			$data = wp_get_attachment_metadata( $post_id );
+				$post_id = $attachment->ID;
 
-    			$this->upload_attachment( $data, $post_id );
+				if ( !( $s3object = $this->get_attachment_s3_info( $post_id ) ) ) {
+					$old_url = $this->get_base_url( wp_get_attachment_url( $post_id ) );
+
+	    			$metadata = wp_get_attachment_metadata( $post_id );
+	    			$files = $this->upload_attachment( $metadata, $post_id );
+
+	    			$new_url = $this->get_base_url( wp_get_attachment_url( $post_id ) );
+
+	    			foreach ( $files as $file ) {
+	    				$postdata['post_content'] = str_replace( $old_url . $file, $new_url . $file, $postdata['post_content'] );
+	    				$postdata['post_excerpt'] = str_replace( $old_url . $file, $new_url . $file, $postdata['post_excerpt'] );
+	    			}
+	    		}
     		}
-    	}
+        }
+
+        return $postdata;
     }
 
     function upload_attachment( $data, $post_id ) {
+    	$uploaded_files = array();
+
         $time = $this->get_attachment_folder_time( $post_id );
         $time = date( 'Y/m', $time );
 
@@ -149,7 +172,7 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
         $acl = apply_filters( 'as3cf_upload_acl', $acl, $data, $post_id );
 
         if ( !file_exists( $file_path ) ) {
-        	return;
+        	return $uploaded_files;
         }
 
         $file_name = basename( $file_path );
@@ -173,10 +196,11 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
 
 		try {
 			$s3client->putObject( $args );
+			$uploaded_files[] = basename( $args['SourceFile'] );
 		}
 		catch ( Exception $e ) {
 			error_log( 'Error uploading ' . $file_path . ' to S3: ' . $e->getMessage() );
-			return;
+			return $uploaded_files;
 		}
 
         delete_post_meta( $post_id, 'amazonS3_info' );
@@ -230,6 +254,7 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
 			try {
 				$args = array_merge( $args, $image );
 				$s3client->putObject( $args );
+				$uploaded_files[] = basename( $args['SourceFile'] );
 			}
 			catch ( Exception $e ) {
 				error_log( 'Error uploading ' . $args['SourceFile'] . ' to S3: ' . $e->getMessage() );
@@ -239,6 +264,8 @@ class Amazon_S3_And_CloudFront extends AWS_Plugin_Base {
         if ( $this->get_setting( 'remove-local-file' ) ) {
         	$this->remove_local_files( $files_to_remove );
         }
+
+        return $uploaded_files;
     }
 
     function remove_local_files( $file_paths ) {
